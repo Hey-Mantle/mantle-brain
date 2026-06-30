@@ -186,7 +186,12 @@ netProRated    = (dailyRateNew − dailyRateOld) × daysRemaining
 - `netProRated > 0` → **charge** that amount as a usage record (upgrade).
 - `netProRated < 0` → **credit** `−netProRated` (downgrade), but capped at what
   you've collected for the current period.
-- `netProRated == 0` → no money moves.
+- `netProRated == 0` → no money moves, but the change still commits in place
+  (don't fall through to a re-approval).
+- `daysInCycle == 0` → a degenerate cycle (e.g. a tier change the same day as
+  signup, before the first charge). Treat proration as $0 rather than dividing by
+  zero. Collecting the outstanding charge first normally advances the period out
+  of this state.
 
 One subtlety: the **label** ("upgraded" vs "downgraded") is decided by comparing
 list prices (`newPlan.amount > oldPlan.amount`), *independently* of the proration

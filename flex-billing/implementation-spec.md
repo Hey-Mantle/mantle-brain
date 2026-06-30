@@ -334,10 +334,17 @@ function changeTier(prevSub, newPlan):
 
     # 2. day-based proration over the CURRENT cycle
     daysInCycle   = days(prevSub.currentPeriodEnd) − days(prevSub.currentPeriodStart)
-    daysRemaining = clamp(days(prevSub.currentPeriodEnd) − days(today), 0, daysInCycle)
-    prevAmount    = prevDiscount ? prevDiscount.priceAfterDiscount : prevSub.plan.amount
-    newAmount     = newDiscount  ? newDiscount.priceAfterDiscount  : newPlan.amount
-    netProRated   = (newAmount/daysInCycle − prevAmount/daysInCycle) × daysRemaining   # >0 charge, <0 credit
+    if daysInCycle <= 0:
+        # Degenerate/collapsed cycle — e.g. a tier change on the SAME day as signup, before the first
+        # charge has run (the period is collapsed to one day at signup, §3). The collect-outstanding step
+        # above normally advances the period to a full interval first; this guard makes the division safe
+        # either way. A zero-length cycle has nothing to pro-rate.
+        netProRated = 0
+    else:
+        daysRemaining = clamp(days(prevSub.currentPeriodEnd) − days(today), 0, daysInCycle)
+        prevAmount    = prevDiscount ? prevDiscount.priceAfterDiscount : prevSub.plan.amount
+        newAmount     = newDiscount  ? newDiscount.priceAfterDiscount  : newPlan.amount
+        netProRated   = (newAmount/daysInCycle − prevAmount/daysInCycle) × daysRemaining   # >0 charge, <0 credit
 
     # 3. write the event NOW (direction by LIST PRICE, independent of proration sign)
     type = newPlan.amount > prevSub.plan.amount ? "upgraded" : "downgraded"
@@ -348,14 +355,15 @@ function changeTier(prevSub, newPlan):
         prorationPlatformId: null, prorationCompletedAt: null,    # filled below when it settles
     }
 
-    if inTrial(prevSub):
-        # no proration money moves while in trial; event row still written
-        continueWithFlexBilling = true
-    else if netProRated > 0:
-        continueWithFlexBilling = upgradeCharge(prevSub, newPlan, netProRated, event)   # §5.a
-    else if netProRated < 0:
-        downgradeCredit(prevSub, newPlan, -netProRated, event)                          # §5.b
-        continueWithFlexBilling = true
+    # Default: stay in place. ONLY a cap-blocked upgrade flips this to false (→ confirmable fallback).
+    # Trial, equal-price (netProRated == 0) and downgrade all stay in place with no money fallback.
+    continueWithFlexBilling = true
+    if not inTrial(prevSub):                  # no proration money moves while in trial; event row still written
+        if netProRated > 0:
+            continueWithFlexBilling = upgradeCharge(prevSub, newPlan, netProRated, event)   # §5.a; false → fallback
+        else if netProRated < 0:
+            downgradeCredit(prevSub, newPlan, -netProRated, event)                          # §5.b
+        # netProRated == 0 → equal-priced swap: no charge, no credit, commit in place
 
     if continueWithFlexBilling:
         commitInPlace(prevSub, newPlan, event)        # §5.c
@@ -417,7 +425,10 @@ When a metered event makes a `unit_limits` charge's limit-metric value cross
 
 ```
 on usage ingest:
-    if (cachedLimitMetricValue + thisEvent) >= charge.limitMax:
+    # The band is INCLUSIVE of limitMax: usage <= limitMax still belongs to this tier; you upgrade only
+    # once it is STRICTLY exceeded. Use the SAME boundary (>) here and in the job below, so hitting exactly
+    # limitMax never enqueues a job that then declines to upgrade.
+    if (cachedLimitMetricValue + thisEvent) > charge.limitMax:
         enqueue CheckAutoUpgradeJob(jobId = "CheckAutoUpgrade:{appInstall}", delay = 60s)   # fixed jobId dedupes
 
 function checkBillingAutoUpgrade(appInstall, cascadeDepth = 0):
