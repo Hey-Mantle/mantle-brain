@@ -1,6 +1,9 @@
 # Local exploration / working area — never committed
 scratch/
 
+# Internal-only agent skills — installed locally so they can be triggered, never committed/shared
+.claude/skills/
+
 # OS / editor cruft
 .DS_Store
 *.swp
