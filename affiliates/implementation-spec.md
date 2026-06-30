@@ -17,7 +17,7 @@
 
 Build a program where affiliates share a tracked link, the installs they drive are
 attributed to them, the revenue those installs generate accrues commission under
-your rules, and commission is paid out via PayPal or Stripe.
+your rules, and commission is paid out through your payment provider.
 
 The invariants that keep it correct:
 
@@ -37,12 +37,11 @@ The invariants that keep it correct:
    commission fields the group itself defines (a per-field merge). This is the
    logic that is easiest to get wrong when you reimplement it.
 5. **Payout = aggregate then pay.** Stage 1 buckets outstanding commissions into a
-   payout (gated by a minimum). Stage 2 moves money on one of two rails. They are
-   separate; money only moves in stage 2.
-6. **Money movements are idempotent and gated.** Every external charge/transfer
-   carries an idempotency key; Stripe transfers are gated on the connected
-   account's *live* capability; aggregation and payment run under per-affiliate
-   locks.
+   payout (gated by a minimum). Stage 2 disburses it through your payment provider.
+   They are separate; money only moves in stage 2.
+6. **Aggregation is idempotent and locked.** Payout aggregation runs under a
+   per-affiliate lock and is safe to re-run. Disbursing a payout through a payment
+   provider is out of scope for this spec (see §8).
 
 If you preserve these six, the rest is bookkeeping.
 
@@ -58,14 +57,15 @@ single-tenant, drop the `organization_id` scoping everywhere and collapse
 One person, across all merchants/programs. Holds payout identity + portal auth.
 - `id`, `email` (**globally unique**), `name?`, `username?` (unique),
   `email_verified_at?`, `image_url?`
-- payout identity: `paypal_email?`, `stripe_account_id?`, `stripe_account JSON?`,
-  `country_code?`, `type` (`person`|`company`), address fields, `tax_id?`
+- payout identity: a destination for your payment provider (e.g. a payout email or
+  connected-account id — shape it to your provider), plus `country_code?`, `type`
+  (`person`|`company`), address fields, `tax_id?`
 - `google_id_token JSON?` (optional OAuth), `password?` (**legacy — not checked at
   login**, see §9)
 
 ### 1.2 `affiliates` — the per-merchant earner
 - `id`, `organization_id`, `email` (**unique only within a merchant**, NOT
-  global), `name?`, `paypal_email?`, `user_id?` → `affiliate_users`
+  global), `name?`, `user_id?` → `affiliate_users`
 - `agreed_to_terms_at?` (merchant-level terms), `payout_hold` (bool — blocks
   payouts), `tags String[]`
 - sweep cursors: `last_transaction_date?`, `last_app_installation_date?` (so the
@@ -124,8 +124,7 @@ One person, across all merchants/programs. Holds payout identity + portal auth.
 - No DB uniqueness on `(transaction, type)` — dedup is in code (§6.4).
 
 ### 1.8 `affiliate_payouts` — the aggregation bucket
-- `id`, `organization_id`, `affiliate_id`, `affiliate_program_id?`,
-  `funding_source_id?`
+- `id`, `organization_id`, `affiliate_id`, `affiliate_program_id?`
 - `number Int?` — **per-merchant sequential** invoice-like number
   (`unique(organization_id, number)`)
 - `status String @default("pending")` — `pending` → `requested` → `processing` →
@@ -135,15 +134,10 @@ One person, across all merchants/programs. Holds payout identity + portal auth.
   `paid_at?`, `paid_by_id?`, `payment_method?`, `payment_method_data JSON?`,
   `payment_requested_at?`
 
-### 1.9 Payout-rail bookkeeping (substitute with your own PSP plumbing)
-- `affiliate_payout_funding_sources` — per-app/division Stripe funding:
-  `stripe_customer_id?`, `stripe_payment_method_id?`, `minimum_payout_amount?`,
-  `payout_method?`
-- `affiliate_paypal_integrations` — per-merchant PayPal OAuth: `access_token`,
-  `refresh_token?`, `email?`, `expires_at?`
-- `affiliate_batch_paypal_payments` + items — mirror a PayPal Payouts batch
-- `affiliate_batch_payments` + items — Stripe-rail equivalent, with
-  `org_fees` / `affiliate_fees` fee splitting
+### 1.9 Payout-rail bookkeeping (out of scope)
+The actual payment integration — your provider's funding source, connection/OAuth
+records, and batch/transfer bookkeeping — is **out of scope for this spec.** Model
+it to fit whatever provider you disburse through (see §8).
 
 ### 1.10 `affiliate_events` — the lifecycle-event spine
 - `id`, `organization_id`, `affiliate_id`, `affiliate_program_id?`,
@@ -153,8 +147,6 @@ One person, across all merchants/programs. Holds payout identity + portal auth.
 ### 1.11 Merchant-level payout config (on your `organization`/settings)
 - `affiliate_minimum_payout_amount` (default 0), `affiliate_payout_start_number`
   (default 1000)
-- `affiliate_payout_fee_split` (default 0.5), `affiliate_payout_fee_percent`
-  (default 0.1)
 - `affiliate_auto_payout_enabled` (default false), `affiliate_auto_payout_schedule?`
   (`weekly`|`biweekly`|`monthly`), `affiliate_auto_payout_day_of_week?` /
   `_day_of_month?`, `affiliate_auto_payout_last_run_at?`
@@ -217,38 +209,10 @@ A ~200-line vanilla-JS snippet placed on your marketing pages:
 Your signup/account-creation call MUST forward the stored code to the attribution
 endpoint (§5).
 
-### 3.3 PayPal Payouts (Rail A)
-- Auth: per-merchant OAuth (`POST /v1/oauth2/token`, `Basic base64(clientId:secret)`,
-  `grant_type=refresh_token`), then Bearer. Host `https://api-m.paypal.com` (prod)
-  / `https://api-m.sandbox.paypal.com` (sandbox).
-- Create batch: `POST /v1/payments/payouts`
-  ```js
-  {
-    sender_batch_header: { sender_batch_id: batch.id },
-    items: [{
-      recipient_type: "EMAIL",
-      amount: { value, currency: "USD" },
-      note: `Payout for <name>. Reference #<number>.`,
-      sender_item_id: payout.id,
-      receiver: affiliate.paypal_email || affiliate.email,   // MUST fall back to regular email
-    }]
-  }
-  ```
-- Reconcile via PayPal webhook (`payouts_item`): `transaction_status: SUCCESS` →
-  mark paid; `RETURNED` / `FAILED` → revert payout to `pending`.
-
-### 3.4 Stripe Connect (Rail B)
-- Onboard the affiliate: `stripe.accounts.create({ type: "express", capabilities:
-  { transfers: { requested: true } }, tos_acceptance: { service_agreement:
-  countryCode === "US" ? "full" : "recipient" } })` + `stripe.accountLinks.create`.
-- **Capability gate** (MUST): before charging, re-fetch the account and require
-  `account.capabilities.transfers === "active"`. Fail closed.
-- Charge yourself: `stripe.paymentIntents.create({ amount: amountCharged*100,
-  customer, payment_method, off_session: true, confirm: true, transfer_group:
-  "affiliate-payouts-<batchId>" }, { idempotencyKey: batchId })`.
-- Pay each affiliate (on `payment_intent.succeeded`): `stripe.transfers.create({
-  amount: (item.amount - item.affiliateFee)*100, destination:
-  affiliate.stripe_account_id, source_transaction: paymentIntent.latest_charge })`.
+### 3.3 Payout disbursement (out of scope)
+Paying a payout out to an affiliate goes through your own payment provider (PayPal
+Payouts, Stripe Connect, bank transfer, …). That integration is **out of scope for
+this spec** — see §8 for the provider-agnostic contract it must satisfy.
 
 ---
 
@@ -466,7 +430,7 @@ generatePayoutsForAffiliate(affiliate):
     lock(`AffiliatePayout:${affiliate.id}`, 5min):              # per-affiliate
         outstanding = commissions(affiliate, payout_id=null, deleted_at=null, cancelled=false)
         total = sum(outstanding.amount)
-        minimum = fundingSource.minimum_payout_amount ?? org.affiliate_minimum_payout_amount ?? 0
+        minimum = org.affiliate_minimum_payout_amount ?? 0
 
         payout = openPendingPayout(affiliate)
         if not payout:
@@ -492,50 +456,35 @@ generatePayoutsForAffiliate(affiliate):
 
 ---
 
-## 8. Procedure: payment (two rails)
+## 8. Procedure: payment
 
-Both terminate in `markPayoutAsPaid(payout, method)` → `status="paid"`, `paid_at`,
-`amount_paid`, `payment_method`.
+Disbursing a payout — the actual money movement — goes through **your own payment
+provider** (PayPal Payouts, Stripe Connect, bank transfer, …) and is **out of
+scope for this spec.** Below is only the provider-agnostic contract that wraps it.
 
-### 8.a Rail A — PayPal Payouts (pass-through, no fee, simplest)
-Merchant connects their own PayPal (§3.3). Push one batch to affiliate emails. No
-up-front charge, no fee split. Reconcile async off the PayPal webhook.
-**MUST use `affiliate.paypal_email || affiliate.email` as the recipient.**
+A payment run:
+1. Selects payable payouts (status `pending` or `requested`; skip `payout_hold`
+   affiliates and any without a usable payout method).
+2. Hands each to your provider to disburse to the affiliate.
+3. On confirmed disbursement, calls `markPayoutAsPaid(payout, method)` →
+   `status = "paid"`, `paid_at`, `amount_paid`, `payment_method`.
+4. On failure, returns the payout to `pending` so it re-aggregates.
 
-### 8.b Rail B — Stripe Connect (you broker; optional fee)
-Charge yourself for the batch total, then transfer to each affiliate's Express
-account. Fee math (round each to 2 dp):
-```
-feePercent  = org.affiliate_payout_fee_percent        # default 0.10
-feeSplit    = org.affiliate_payout_fee_split           # default 0.5
-per payout:  fee          = round2(amount × feePercent)
-             orgFee       = round2(fee × feeSplit)        # you absorb
-             affiliateFee = round2(fee − orgFee)          # affiliate absorbs
-batch:       amountCharged = Σ(amount + orgFee)           # what YOU pay in
-             amountPaid    = Σ(amount − affiliateFee)      # what affiliates RECEIVE
-```
-Defaults → org pays 1.05×, affiliate gets 0.95×, you keep the full 10%. Zero
-`feePercent` to not monetize.
+Provider-specific concerns belong **inside that integration, not here**:
+idempotency on every money movement, verifying the destination can actually
+receive funds before charging, any fee handling, and reconciling partial-batch
+failures.
 
-**MUST** on this rail: idempotency key on the PaymentIntent (the batch id);
-re-query the batch's payouts inside the charge to avoid double-pay under a race;
-the §3.4 live-capability gate before charging; **one funding source per batch**
-(reject mixed Stripe customers); and a **partial-failure reconcile** — only an
-all-fail batch auto-refunds, so a separate sweep must refund the net shortfall
-when some transfers succeed and some fail, treating Stripe's own refund list
-(incl. manual dashboard refunds) as source of truth.
-
-### 8.c Status lifecycle
+### 8.a Status lifecycle
 `pending → requested → processing → paid`; `cancelled` detaches the commissions
 back to `payout_id = null` (so they re-aggregate) and is refused once
 paid/processing. Both `pending` and `requested` are payable.
 
-### 8.d Auto-payout (optional)
+### 8.b Auto-payout (optional)
 A daily cron (Mantle: `0 0 10 * * *`) checks each merchant's
 weekly/biweekly/monthly schedule (with a catch-up window + `last_run_at` guard),
-selects eligible payouts — **excluding `payout_hold` affiliates and those without
-a connected payout account, after the live-capability check** — groups by funding
-source, and runs the batch off-session.
+selects eligible payouts (**excluding `payout_hold` affiliates and any without a
+usable payout method**), and disburses them through your provider.
 
 ---
 
@@ -623,13 +572,9 @@ Treat as acceptance criteria.
   install, a transaction yields at most one program's commission set.
 - **MUST gate only NEW payout creation on the minimum** — commissions still append
   to an existing pending payout below it.
-- **MUST run aggregation and payment under per-affiliate locks**, and key every
-  external charge/transfer with an idempotency key.
-- **MUST gate Stripe transfers on the connected account's LIVE `transfers`
-  capability** before charging — fail closed.
-- **MUST handle Stripe partial-batch failure** — you charged the full batch but
-  only some transfers landed; reconcile the shortfall (only all-fail auto-refunds).
-- **MUST use `paypal_email || email`** as the PayPal recipient.
+- **MUST run payout aggregation under a per-affiliate lock** and re-read inside it
+  (idempotent re-run). Disbursement itself is handled by your provider integration
+  (out of scope — §8).
 - **MUST scope affiliate-asset downloads** to the membership's program and the
   asset's visibility (see §9) and guard the null case.
 - **MUST NOT check the portal `password` field at login** — OTP is the gate.
@@ -647,9 +592,9 @@ Treat as acceptance criteria.
 ## 12. Caveats (read before going to production)
 
 - **Currency is single-rail by default.** The model carries **no FX**: amounts are
-  in the transaction's native units, imports assume `USD`, and PayPal items post
-  `currency: "USD"`. If you serve non-USD merchants, normalize currency explicitly
-  across transaction amount, commission amount, and payout rather than assuming one.
+  in the transaction's native units and imports assume `USD`. If you serve non-USD
+  merchants, normalize currency explicitly across transaction amount, commission
+  amount, and payout rather than assuming one.
 - **Money precision.** If you compute amounts with floating point and only round at
   the payment boundary, stored values can carry float artifacts. For exact money,
   store integer minor units.
@@ -693,15 +638,14 @@ Implement and verify each:
     only once past the minimum; below-minimum commissions still append to an
     existing pending payout; the payout gets the next per-merchant number and a
     chained period.
-11. **PayPal payment.** Batch pays to `paypal_email || email`; `SUCCESS` webhook
-    marks paid; `RETURNED`/`FAILED` reverts to pending.
-12. **Stripe payment.** Charge gated on live `transfers` capability + idempotency
-    key; fee split matches the formula; a partial-failure batch reconciles the
-    shortfall.
-13. **Cancellation.** Cancelling a commission nulls its `payout_id`, zeroes it in
+11. **Payment.** Disbursing a payable payout through your provider and confirming
+    it calls `markPayoutAsPaid` (status `paid`, `amount_paid` set); a failed
+    disbursement returns the payout to `pending`. (The provider integration itself
+    is out of scope.)
+12. **Cancellation.** Cancelling a commission nulls its `payout_id`, zeroes it in
     totals, and re-runs aggregation.
-14. **Auto-payout.** Runs on the merchant's cadence; skips `payout_hold` and
-    accounts without a connected payout method.
-15. **Portal.** OTP login works without a password; "remember me" honors the
+13. **Auto-payout.** Runs on the merchant's cadence; skips `payout_hold` and
+    affiliates without a usable payout method.
+14. **Portal.** OTP login works without a password; "remember me" honors the
     30-day verified window; a pre-created affiliate is adopted on signup by
     matching email; an asset download cannot read another program's asset id.

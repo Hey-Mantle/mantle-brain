@@ -2,8 +2,8 @@
 
 An Agent skill that implements a **referral/affiliate program** — tracked referral
 links, click-to-install attribution, commission accrual on referred revenue, and
-affiliate payouts via PayPal or Stripe Connect (plus an affiliate portal) — in
-*your* codebase.
+affiliate payout aggregation (plus an affiliate portal) — in *your* codebase. The
+final disbursement step is wired to your own payment provider (out of scope).
 
 ## Install
 
@@ -37,13 +37,13 @@ through the implementation phases described in [`SKILL.md`](./SKILL.md).
 | File | Purpose |
 |---|---|
 | `SKILL.md` | The procedure the agent follows (phases, guardrails). |
-| `references/implementation-spec.md` | The precise, self-contained build spec (data model, API shapes, pseudocode, commission math, edge cases, acceptance tests). |
+| `references/implementation-spec.md` | The precise, self-contained build spec (data model, pseudocode, commission math, payout aggregation, edge cases, acceptance tests). |
 
 ## Prerequisites the agent will check
 
 - A stream of billing **transactions** to read (the commission engine derives
   commissions from your billing events — Shopify subscription/usage transactions,
   Stripe, etc.).
-- For payouts: a business **PayPal** account with Payouts API access (the simplest
-  rail), and/or a **Stripe** account with **Connect** enabled (Express accounts)
-  if you want to broker payouts and optionally take a fee.
+- For payouts: *some* way to pay affiliates (PayPal, Stripe, bank transfer,
+  manual). The skill builds everything up to "mark the payout paid"; the actual
+  payment-provider integration is yours to wire in and is out of scope.

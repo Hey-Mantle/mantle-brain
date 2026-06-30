@@ -6,8 +6,8 @@ Partners recreate Mantle's tools as Mantle winds down.*
 This guide explains **how Mantle's Affiliates system worked and how to rebuild it
 in your own app** — a referral/partner program where affiliates share a tracked
 link, the installs they drive are attributed to them, the revenue those installs
-generate earns commission, and that commission is paid out automatically via
-PayPal or Stripe.
+generate earns commission, and that commission is paid out through your own
+payment provider.
 
 If you'd rather hand the job to a coding agent, this folder ships two companions:
 
@@ -34,7 +34,7 @@ of the revenue those installs produce. That needs four things to hang together:
 - a **commission engine** that turns each referred install's billing into money
   owed, under rules you control (percentage, recurring vs one-time, eligibility
   gates);
-- and a **payout rail** that actually moves money to the affiliate.
+- and a **payout step** that actually moves money to the affiliate.
 
 Mantle built all four. The whole thing is organized around one unit of identity.
 
@@ -65,7 +65,7 @@ Mantle built all four. The whole thing is organized around one unit of identity.
    commissions accumulate ──► aggregated into a PAYOUT when past a minimum
            │
            ▼
-   PAID   via PayPal Payouts (pass-through) or Stripe Connect (you broker + fee)
+   PAID   disbursed through your payment provider, then marked paid
 ```
 
 Four stages — **referral → attribution → commission → payout** — and a handful of
@@ -83,7 +83,7 @@ live. More on that below.
 
 | Concept | What it means |
 |---|---|
-| **Affiliate user** | A *global* login identity — one person, unique email, who can be an affiliate across many merchants/programs. Holds payout identity (PayPal email, Stripe Connect account) and the portal login. |
+| **Affiliate user** | A *global* login identity — one person, unique email, who can be an affiliate across many merchants/programs. Holds payout identity (where to send their money) and the portal login. |
 | **Affiliate** | A *per-merchant* participant record that actually earns commission. Linked to an affiliate-user by email. (If your app is single-tenant, this and the affiliate-user collapse into one row.) |
 | **Program** | A referral program you (the merchant) own. Holds the commission **rules** and the join policy. |
 | **Membership** | Joins an affiliate to a program. **Its `handle` field *is* the `mref` referral code.** Carries the join status and any per-affiliate rule override. |
@@ -145,11 +145,10 @@ commissions. Once the running total clears a minimum threshold, it opens a
 `pending` payout with a sequential number and a billing period.
 
 ### 8. The payout is paid
-Either **PayPal Payouts** (you push a batch from your own PayPal straight to
-affiliate emails — no fee, simplest) or **Stripe Connect** (you charge yourself
-up front, then transfer to each affiliate's connected account, optionally keeping
-a fee). The payout is marked `paid`. An auto-payout scheduler can run this on a
-weekly/biweekly/monthly cadence.
+You disburse the payout to the affiliate through your own payment provider (PayPal
+Payouts, Stripe Connect, bank transfer — your call; that integration is out of
+scope for this guide) and mark it `paid`. An auto-payout scheduler can run this on
+a weekly/biweekly/monthly cadence.
 
 Alongside all of this runs an **affiliate portal** (a separate login where
 affiliates see their stats, grab creative assets, and request payouts) and an
@@ -278,10 +277,10 @@ incremental and idempotent. Per transaction it walks a chain of skip-gates:
 
 ---
 
-## The payout rails
+## Payouts
 
 Two clearly separated stages: **aggregate** (no money moves), then **pay** (money
-moves, via one of two rails).
+moves, through your payment provider).
 
 ### Stage 1 — Aggregation
 Per affiliate, under a per-affiliate lock:
@@ -294,45 +293,15 @@ Per affiliate, under a per-affiliate lock:
   end. Emit a `payout_pending` event.
 
 ### Stage 2 — Payment
-
-**Rail A — PayPal Payouts (pass-through, simplest).** The merchant connects their
-own PayPal via OAuth; you push a batch payout straight to affiliate emails. No
-up-front charge, no fee split. The recipient email **falls back to the affiliate's
-regular email** when no dedicated PayPal email is set — don't drop the payment
-just because the PayPal-email field is blank. Reconcile asynchronously off PayPal
-webhooks: `SUCCESS` → mark paid; `RETURNED`/`FAILED` → revert to pending.
-
-**Rail B — Stripe Connect (you broker the money, optionally take a fee).** Charge
-*yourself* up front for the batch total, then fan out one transfer per affiliate
-to their Stripe Express connected account. This is the rail that lets you monetize
-the program:
-
-```
-feePercent = 0.10            // your cut of each payout
-feeSplit   = 0.50            // how the fee is split between you and the affiliate
-
-per payout:  fee          = round2(amount × feePercent)
-             orgFee       = round2(fee × feeSplit)         // you absorb
-             affiliateFee = round2(fee − orgFee)           // affiliate absorbs
-batch:       amountCharged = Σ(amount + orgFee)            // what YOU pay in
-             amountPaid    = Σ(amount − affiliateFee)      // what affiliates RECEIVE
-```
-
-With the defaults, a 10% fee split 50/50 means you pay in 1.05× and the affiliate
-receives 0.95× — you keep the whole 10%. Zero out `feePercent` if you don't want
-to monetize. The design points that make this rail safe (worth copying):
-
-- **Idempotency keys on every money movement** (key the PaymentIntent by batch id).
-- **Re-query the payouts inside the batch** to avoid double-paying under a race.
-- **Gate on the *live* Stripe transfers capability** before charging — check the
-  connected account can actually receive transfers, fail closed. (This prevents
-  charging for a payout that can never be delivered.)
-- **One funding source per batch** — don't mix Stripe customers in one charge.
-- **Handle partial failure.** If you charged the full batch but only some
-  transfers succeeded, you're over-collected until you reconcile. Only an
-  *all-fail* batch auto-refunds; partial shortfalls need a reconcile sweep that
-  treats Stripe's own refund list (including manual dashboard refunds) as source
-  of truth.
+Disbursing a payout — the actual money movement — runs through **your own payment
+provider** (PayPal Payouts, Stripe Connect, a bank transfer, whatever you already
+use). **That integration is out of scope for this guide** — it's the part most
+specific to your stack and your provider's API. All this layer needs from it is a
+simple contract: hand a payable payout to the provider, and when the disbursement
+is confirmed, mark the payout `paid` (set `amount_paid`); if it fails, leave it
+`pending` so it re-aggregates. Idempotency, verifying the destination can receive
+funds, any fee handling, and reconciling partial failures all live inside that
+provider integration.
 
 ### Status lifecycle
 `pending → requested → processing → paid`, plus `cancelled` (which detaches the
@@ -342,8 +311,8 @@ Both `pending` and `requested` payouts are eligible to be paid.
 ### Auto-payout
 A daily scheduler checks each merchant's weekly/biweekly/monthly cadence (with a
 catch-up window and a `lastRunAt` guard), selects eligible payouts — **excluding
-affiliates on payout-hold and those without a connected payout account** — groups
-them by funding source, and runs the batch off-session.
+affiliates on payout-hold and those without a usable payout method** — and
+disburses them through your provider.
 
 ---
 
@@ -421,9 +390,6 @@ where a quiet default has real consequences. Decide each one on purpose.
   constraint or a per-install lock (so concurrency can't create two active rows).
 - **The minimum threshold blocks only *new* payout creation.** Commissions still
   append to an existing pending payout below the minimum.
-- **Plan for Stripe partial-batch outcomes.** If you charge a batch up front and
-  only some transfers land, you'll be over-collected until you reconcile — only an
-  all-fail batch auto-refunds, so build a reconcile step for the shortfall.
 - **Scope affiliate-asset downloads.** When you add downloadable creative, look the
   asset up scoped to the requesting membership's program and honor its
   visibility/group/affiliate scoping — don't resolve an asset by id alone — and
@@ -459,12 +425,10 @@ where a quiet default has real consequences. Decide each one on purpose.
 6. **Payout aggregation** — per-affiliate bucketing, minimum gate, per-merchant
    sequential number, chained periods, idempotent re-run under a lock.
 7. A **payout status machine** — `pending → requested → processing → paid`, plus
-   `cancelled`.
-8. **At least one payout rail** — PayPal Payouts is simplest (pass-through,
-   OAuth + webhook reconcile; remember the email fallback); Stripe Connect if you
-   want to take a fee (charge-then-transfer, live-capability gate, idempotency,
-   partial-failure reconcile).
-9. An **event emit-point + webhook signing**, and a notification subscription
+   `cancelled` — with a thin contract to your payment provider (hand it a payable
+   payout; mark `paid` on confirmation, `pending` on failure). The provider
+   integration itself (PayPal, Stripe, bank transfer, …) is **out of scope here.**
+8. An **event emit-point + webhook signing**, and a notification subscription
    model with per-(event, rule, recipient) idempotency. Add the money events
    Mantle lacks if your customers want them.
 
@@ -475,8 +439,6 @@ where a quiet default has real consequences. Decide each one on purpose.
 - Columnar analytics reads (ClickHouse) and search-index reads (Elasticsearch) →
   plain SQL/ORM queries. The `uncancelled / not-deleted / payout-status` filters
   are the part that matters.
-- Per-division multi-Stripe funding sources → a single org-level Stripe customer +
-  payment method.
 
 **Skip (Mantle-specific scaffolding):**
 - **The Google-Analytics→BigQuery attribution reconstruction.** It exists only
