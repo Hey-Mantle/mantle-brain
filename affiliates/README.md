@@ -111,7 +111,8 @@ unique `handle` derived from their name/username/email with a collision suffix.
 Status becomes `enrolled` (or `pending` if the program requires approval).
 
 ### 2. They share a link
-`link = (program.customLink || "https://apps.shopify.com/<your-app>") + "?mref=" + handle`.
+`link = baseUrl + (baseUrl.includes("?") ? "&" : "?") + "mref=" + handle`, where
+`baseUrl = program.customLink || "https://apps.shopify.com/<your-app>"`.
 The `apps.shopify.com` base is the only Shopify-specific bit — swap in your own
 landing/signup URL for a non-App-Store funnel.
 
@@ -183,15 +184,14 @@ database constraint. When a second referral lands on an install that's already
 attributed, you must choose:
 
 - **Last-write-wins** — the new affiliate takes over; the prior attribution is
-  soft-deleted. (Mantle's identify and manual-claim paths do this.)
+  soft-deleted.
 - **First-write-wins** — the original affiliate keeps the install; later referrals
-  are ignored. (Mantle's server-to-server attribution endpoint does this, guarded
-  by a per-install lock.)
+  are ignored, guarded by a per-install lock.
 
-Mantle is not uniform about this across its entry paths — which is itself the
-gotcha. **Pick one, write it down, and enforce it with a uniqueness constraint or
-a per-install lock.** A lock matters because the natural ordering key
-(`createdAt`) doesn't reliably reflect commit order under concurrency.
+**Pick one, write it down, and apply it consistently across every entry path,
+enforced with a uniqueness constraint or a per-install lock.** A lock matters
+because the natural ordering key (`createdAt`) doesn't reliably reflect commit
+order under concurrency.
 
 ---
 
@@ -221,17 +221,19 @@ yourself.
 Rules can be defined at four levels. Precedence, highest first:
 **attribution snapshot > membership (custom) override > group tier > program**.
 
-The trap: this is **not a deep merge.** When a lower level is overridden, the
-*commission fields* (`percentCommission`, `durationMonths`, `revenueComponents`,
-`minPlanValue`) from the parent are **dropped, not inherited.**
+The trap: this is **not a deep merge.** A `custom` membership override or an
+attribution snapshot **drops all four** *commission fields* (`percentCommission`,
+`durationMonths`, `revenueComponents`, `minPlanValue`) from the parent. A `group`
+override is gentler — a **per-field merge** that drops only the commission fields
+the group itself sets, leaving the rest to fall through from the program.
 
 > Switching a membership to a `custom` override — *even with an empty `{}`* —
 > strips the program's `minPlanValue`, `durationMonths`, `revenueComponents`, and
 > `percentCommission`. A custom flat rate does **not** silently inherit the
 > program's eligibility gates. (The non-commission fields — `amountPerInstall`,
-> `signupBonus`, `revenueType` — *do* still fall through.)
+> `signupBonus`, `revenueType` — *do* still fall through, at every tier.)
 
-This is the highest bug-risk logic in the whole system. If you take one thing from
+This is the logic that's easiest to get wrong when you reimplement it. If you take one thing from
 this guide: **port the rule-resolution unit tests verbatim** and treat that
 function as load-bearing.
 
@@ -242,8 +244,9 @@ affiliate's transactions since a stored cursor (`lastTransactionDate`), so it's
 incremental and idempotent. Per transaction it walks a chain of skip-gates:
 
 1. Pick `gross` or `net` amount per the rules.
-2. **Skip non-positive amounts** — a refund or credit (`amount <= 0`) is *silently
-   skipped, not clawed back.* (See gotchas.)
+2. **Skip non-positive amounts** — a transaction whose *gross* amount is `<= 0`
+   (a refund or credit) earns nothing and is not clawed back. (This is a policy
+   choice — see "design decisions" below.)
 3. Skip if the transaction predates the program's or the affiliate's
    "start counting from" cutoff.
 4. **revenueComponents filter** — skip if this transaction's kind
@@ -269,9 +272,9 @@ incremental and idempotent. Per transaction it walks a chain of skip-gates:
 
 ### Totals
 - **Total earned** = sum of commissions that are not deleted and not cancelled.
-- **Outstanding** (payable) = the same, further restricted to commissions not yet
-  on a *paid* payout. A cancelled commission counts as zero in both, even if it's
-  sitting on a pending payout.
+- **Outstanding** (payable) = the same, further restricted to commissions with no
+  payout yet *or* on a still-`pending` payout. A cancelled commission counts as
+  zero in both, even if it's sitting on a pending payout.
 
 ---
 
@@ -317,13 +320,13 @@ batch:       amountCharged = Σ(amount + orgFee)            // what YOU pay in
 
 With the defaults, a 10% fee split 50/50 means you pay in 1.05× and the affiliate
 receives 0.95× — you keep the whole 10%. Zero out `feePercent` if you don't want
-to monetize. The hard-won production lessons on this rail (worth copying):
+to monetize. The design points that make this rail safe (worth copying):
 
 - **Idempotency keys on every money movement** (key the PaymentIntent by batch id).
 - **Re-query the payouts inside the batch** to avoid double-paying under a race.
 - **Gate on the *live* Stripe transfers capability** before charging — check the
-  connected account can actually receive transfers, fail closed. (An in-code
-  comment marks this as a fix for a real money leak.)
+  connected account can actually receive transfers, fail closed. (This prevents
+  charging for a payout that can never be delivered.)
 - **One funding source per batch** — don't mix Stripe customers in one charge.
 - **Handle partial failure.** If you charged the full batch but only some
   transfers succeeded, you're over-collected until you reconcile. Only an
@@ -394,47 +397,45 @@ POST, 5s timeout, retried up to 10× with exponential backoff (1s base).
 
 ---
 
-## Gotchas — the lessons that cost real money (or trust)
+## Design decisions & sharp edges
 
-Each of these is a real sharp edge in the Mantle implementation.
+These are the calls you have to make consciously when you build this — the places
+where a quiet default has real consequences. Decide each one on purpose.
 
-- **Rule override silently drops parent gates.** Switching a membership to a
-  `custom` override — even an empty one — escapes the program's `minPlanValue`,
-  `durationMonths`, `revenueComponents`, and `percentCommission`. The #1 surprise.
-- **No automatic refund clawback.** A refund (non-positive transaction amount) is
-  *skipped*, not reversed. Cancelling a commission is a manual admin action only.
-  **If you tell customers you "claw back on refund," you must build that** —
-  Mantle does not.
+- **Rule override is intentionally not a deep merge.** Switching a membership to a
+  `custom` override — even an empty one — drops the program's `minPlanValue`,
+  `durationMonths`, `revenueComponents`, and `percentCommission` (a `group`
+  override drops only the commission fields it sets). This is by design so a custom
+  rate doesn't silently inherit program gates — but it's the #1 thing to get right.
+- **Refunds are a policy choice.** A non-positive (`gross <= 0`) transaction earns
+  nothing and isn't auto-reversed; voiding an existing commission is an explicit
+  admin action. If you want to advertise "claw back on refund," build that
+  deliberately — it isn't automatic.
 - **The duration window starts at the first commission's date,** not the
   attribution date. A late first transaction shifts the whole window.
 - **The signup bonus attaches to the first *eligible* transaction.** If the first
   transaction is a refund or fails a gate, the bonus lands on a later one.
-- **De-dup policy isn't uniform across entry paths.** The same handle through
-  different doors can overwrite or not overwrite an existing attribution
-  differently. Pick one policy and enforce it.
-- **One active attribution per install is code-enforced, not a DB constraint** —
-  so concurrency can violate it without a lock.
+- **Pick one attribution de-dup policy and enforce it.** When a second referral
+  lands on an already-attributed install, first-write-wins and last-write-wins are
+  both defensible — choose one, write it down, and back it with a uniqueness
+  constraint or a per-install lock (so concurrency can't create two active rows).
 - **The minimum threshold blocks only *new* payout creation.** Commissions still
   append to an existing pending payout below the minimum.
-- **Stripe partial-batch failures over-collect.** You charged the full batch but
-  only some transfers landed; reconcile the shortfall or the merchant is out of
-  pocket.
-- **Affiliate-asset downloads were under-scoped.** In Mantle's portal, the asset-
-  download endpoint authorizes the *membership* (it belongs to you) but fetches
-  the asset **by id alone** — with no check that the asset belongs to that
-  membership's program, and no enforcement of the asset's own visibility/group/
-  affiliate scoping. Any logged-in affiliate could read any asset id, across
-  merchants. **When you build assets, scope the asset query to the membership's
-  program and enforce its visibility rules** — and guard the not-found case so a
-  bad id is a clean 404, not a crash.
+- **Plan for Stripe partial-batch outcomes.** If you charge a batch up front and
+  only some transfers land, you'll be over-collected until you reconcile — only an
+  all-fail batch auto-refunds, so build a reconcile step for the shortfall.
+- **Scope affiliate-asset downloads.** When you add downloadable creative, look the
+  asset up scoped to the requesting membership's program and honor its
+  visibility/group/affiliate scoping — don't resolve an asset by id alone — and
+  return a clean 404 (not a crash) for a missing/unauthorized id.
 - **Two email-uniqueness scopes.** The global affiliate-user email is unique
   everywhere; the per-merchant affiliate email is unique only within a merchant.
   They're distinct identities linked by id.
 - **Re-importing an affiliate by email revives a soft-deleted record** (clears its
   deleted flag). Decide whether that's what you want.
-- **No currency conversion anywhere.** Amounts are in the transaction's native
-  units; the importers hardcode USD. Don't assume single-currency if your
-  merchants aren't.
+- **Currency is single-rail by default.** Amounts are in the transaction's native
+  units with no FX, and the importers assume USD. If your merchants aren't all USD,
+  normalize currency explicitly rather than assuming one.
 
 ---
 

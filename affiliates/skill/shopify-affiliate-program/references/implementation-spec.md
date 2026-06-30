@@ -9,8 +9,8 @@
 >
 > **Provenance:** distilled from the production behavior of Mantle's Affiliates
 > subsystem. Stack-agnostic; map the generic table/field names below onto your own
-> ORM. Where a rule encodes a hard-won lesson or a real bug, it is marked
-> **MUST** / **MUST NOT**.
+> ORM. Where a rule encodes a deliberate design decision or a sharp edge worth
+> getting right, it is marked **MUST** / **MUST NOT**.
 
 ---
 
@@ -32,9 +32,11 @@ The invariants that keep it correct:
 3. **Commissions are derived, not posted inline.** A sweep reads each referred
    install's transactions since a per-affiliate cursor and mints commission rows.
    The sweep is incremental and idempotent (dedup by `(affiliate, transaction)`).
-4. **Rule resolution is a deliberate non-merge.** When a lower tier (group /
-   membership / attribution) overrides, the parent's *commission fields* are
-   dropped, not inherited. This is the highest-bug-risk logic in the system.
+4. **Rule resolution is a deliberate non-merge.** When a `custom` membership
+   override or an attribution snapshot applies, the parent's *commission fields*
+   are dropped wholesale, not inherited; a `group` override drops only the
+   commission fields the group itself defines (a per-field merge). This is the
+   logic that is easiest to get wrong when you reimplement it.
 5. **Payout = aggregate then pay.** Stage 1 buckets outstanding commissions into a
    payout (gated by a minimum). Stage 2 moves money on one of two rails. They are
    separate; money only moves in stage 2.
@@ -284,7 +286,7 @@ rejectMembership(m):   m.status = "rejected"; emit "join_denied"
 ## 5. Procedure: attribution
 
 ```
-attributeReferralCode(code, appInstallation, { affiliateProgram or appId }):
+attributeReferralCode(code, appInstallation, date, { affiliateProgram or appId }):
     membership = findMembership(handle=code, deletedAt=null, program scoped to appId,
                                 status="enrolled")        # MUST scope to the app/program
     if not membership: return null
@@ -292,10 +294,14 @@ attributeReferralCode(code, appInstallation, { affiliateProgram or appId }):
                                                appInstallation, date)
 
 attributeAffiliateToAppInstallation(affiliate, program, appInstallation, date):
-    active = appInstallation.attributions where deletedAt=null
+    active = appInstallation.attributions where deletedAt=null      # spans ALL programs on this install
     existing = active.find(a => a.affiliate==affiliate AND a.program==program)
 
     # de-dup policy (LAST-write-wins shown; choose ONE and document it):
+    # Soft-deleting the whole `active` set (except `existing`) enforces ONE active
+    # attribution per install ACROSS programs — Mantle's behavior. Alternatives:
+    #   first-write-wins      → if active.length > 0: return active[0]   (ignore the new referral)
+    #   per-(install,program) → filter `active` to a.program == program before deleting
     if active.length > 0:
         softDelete(active where id != existing?.id)       # deletedAt = now
 
@@ -348,61 +354,77 @@ program**. Let `COMMISSION_FIELDS = ["percentCommission","durationMonths",
 
 ```
 resolveRules(program, membership, attribution):
-    fallback = { ...program.rules,
-                 ...(membership.rules_override == "group"  ? membership.group.rules : {}),
-                 ...(membership.rules_override == "custom" ? membership.rules       : {}) }
+    groupRules = (membership.rules_override == "group" ? (membership.group?.rules || {}) : {})
+    fallback   = { ...program.rules,
+                   ...groupRules,
+                   ...(membership.rules_override == "custom" ? (membership.rules || {}) : {}) }
 
-    if attribution.rules:                       # attribution snapshot wins outright
+    if attribution.rules:                       # attribution snapshot wins outright (FULL drop)
         return { ...omit(fallback, COMMISSION_FIELDS), ...attribution.rules }
 
-    if membership.rules_override == "custom":   # program commission fields do NOT leak through
+    if membership.rules_override == "custom":   # FULL drop: program commission fields do NOT leak through
         return { ...omit(fallback, COMMISSION_FIELDS), ...(membership.rules || {}) }
 
-    if membership.rules_override == "group" and (group.rules.percentCommission or
-                                                 group.rules.amountPerInstall):
-        toOmit = COMMISSION_FIELDS.filter(f => group.rules[f] !== undefined)
-        return { ...omit(fallback, toOmit), ...group.rules }
+    if membership.rules_override == "group" and (groupRules.percentCommission or
+                                                 groupRules.amountPerInstall):
+        toOmit = COMMISSION_FIELDS.filter(f => groupRules[f] !== undefined)   # PER-FIELD drop
+        return { ...omit(fallback, toOmit), ...groupRules }
 
     return fallback
 ```
 
-- **MUST drop the parent's commission fields when a lower tier overrides** — even a
-  `custom` override with empty `{}` strips program `minPlanValue` / `durationMonths`
-  / `revenueComponents` / `percentCommission`. An explicit `minPlanValue: 0` in the
-  override DOES win (it is a set value, not absent).
+- **`custom` and attribution overrides do a FULL drop** of the four
+  `COMMISSION_FIELDS` from the fallback — even a `custom` override with empty `{}`
+  strips program `minPlanValue` / `durationMonths` / `revenueComponents` /
+  `percentCommission`. An explicit `minPlanValue: 0` in the override DOES win (it is
+  a set value, not absent).
+- **A `group` override is a PER-FIELD merge** — it drops only the commission fields
+  the group itself defines, so any it leaves undefined still fall through from the
+  program. This asymmetry is real; don't "fix" it into a full drop unless you
+  intend different semantics.
 - `amountPerInstall`, `signupBonus`, `revenueType` are NOT commission fields and
   always fall through.
 
 ### 6.3 The scan
+Each install has at most one active attribution (§5), so each transaction maps to a
+single `(program, attribution)` to process under.
 ```
 checkCommissionsForAffiliate(affiliate):
-    cursor = max(affiliate.last_transaction_date, affiliate.start_counting_commission_from)
-    for each batch of 200 transactions of affiliate's attributed installs,
+    installs = distinct app_installation_ids of affiliate's active attributions
+    cursor   = max(affiliate.last_transaction_date, affiliate.start_counting_commission_from)
+    for each batch of 200 transactions of those installs,
         ordered by date asc, where date > cursor:
         for tx in batch:
-            for each (program, attribution) attributing tx's install:
-                processTransaction(affiliate, program, attribution, tx)
-        affiliate.last_transaction_date = batch.last.date      # advance cursor (idempotent)
+            attribution = active attribution for tx's install         # ≤1 per install (§5)
+            membership  = membership(affiliate, attribution.program)
+            processTransaction(affiliate, attribution.program, membership,
+                               attribution, tx.install, tx)
+        affiliate.last_transaction_date = batch.last.date             # advance cursor (idempotent)
 ```
 
-### 6.4 The per-transaction gate chain (each is a "skip/continue")
+### 6.4 The per-transaction gate chain (each gate is a WHOLE-transaction skip)
+A failed gate skips this transaction entirely (`return`) — it does not fall through
+to another program, because there is only one attribution per install.
 ```
-processTransaction(affiliate, program, attribution, tx):
-    rules = resolveRules(program, membership, attribution)
+processTransaction(affiliate, program, membership, attribution, install, tx):
+    rules  = resolveRules(program, membership, attribution)
     amount = rules.revenueType == "net" ? tx.netAmount : tx.grossAmount
 
-    if tx.grossAmount <= 0:                          continue   # refund/credit SILENTLY SKIPPED (no clawback)
-    if tx.date < program.start_counting_commission_from:  continue
-    if tx.date < affiliate.start_counting_commission_from: continue
+    if tx.grossAmount <= 0:                                 return   # refund/credit SILENTLY SKIPPED (no clawback)
+    if tx.date < program.start_counting_commission_from:   return
+    if tx.date < affiliate.start_counting_commission_from: return
     component = ({subscription_sale:"subscription", usage_sale:"usage",
                  one_time_sale:"one-time"})[tx.type]
-    if rules.revenueComponents?.length and component not in rules.revenueComponents: continue
+    if rules.revenueComponents?.length and component not in rules.revenueComponents: return
     if rules.minPlanValue and install.activeSubscription
-       and install.activeSubscription.plan.amount < rules.minPlanValue:            continue
-    if commissionExists(affiliate, tx):              break      # dedup: one tx → at most one program's commissions
+       and install.activeSubscription.plan?.amount < rules.minPlanValue:           return
+    if commissionExists(affiliate, tx):                    return   # dedup: idempotent re-run; one tx → one set
 
-    # ---- mint commissions ----
-    earliest = earliestCommission(affiliate, program, install)
+    # earliest TRANSACTION-derived commission for (affiliate, program, install),
+    # EXCLUDING this tx (idempotent re-runs) AND the install bounty (it has no
+    # transaction id, so it must NOT set the window origin or suppress signup):
+    earliest = earliestCommission(affiliate, program, install,
+                                  excludeTransaction=tx, excludeType="install")
 
     # SIGNUP (one-time): only if no earlier commission exists for this program+install
     if not earliest and rules.signupBonus:
@@ -410,10 +432,10 @@ processTransaction(affiliate, program, attribution, tx):
 
     # PERCENT (recurring, per eligible transaction):
     if rules.percentCommission:
-        windowStart = earliest?.date                 # window starts at FIRST commission's date, else null
+        windowStart    = earliest?.date              # window opens at the FIRST commission's date, else null
         durationMonths = rules.durationMonths || 0
         if windowStart and durationMonths and tx.date > addMonths(windowStart, durationMonths):
-            # outside the window → skip percent
+            pass                                     # past the window → no percent (boundary month INCLUDED: '>')
         else:
             createCommission(type="percent",
                              amount = amount * (parseFloat(rules.percentCommission) / 100), tx)
@@ -449,9 +471,10 @@ generatePayoutsForAffiliate(affiliate):
 
         payout = openPendingPayout(affiliate)
         if not payout:
-            if total < minimum: return                          # MUST gate NEW payout on minimum
+            if total <= 0 or total < minimum: return            # no empty payout; MUST gate NEW payout on minimum
             payout = createPayout(
-                number      = max(lastOrgPayout.number + 1, org.affiliate_payout_start_number || 1),
+                number      = max((lastOrgPayout?.number ?? 0) + 1,
+                                  org.affiliate_payout_start_number ?? 1000),   # guard first-ever payout
                 status      = "pending",
                 period_start= previousPaidPayout?.period_end,    # chain periods
                 period_end  = now)
@@ -541,11 +564,11 @@ holding `{ id, email, otpVerified }`.
 Groups (rate tiers), assets (creative), a public marketplace, and Liquid branding
 are **nice-to-haves** — none are required for attribution or commissions.
 
-> **MUST scope asset downloads.** A real bug to avoid: authorize the *membership*
-> (it belongs to the user) AND look up the asset **scoped to that membership's
-> program**, enforcing the asset's own `visibility` / `group_ids` / `affiliate_ids`
-> — do not fetch an asset by id alone, or any logged-in affiliate can read any
-> asset across merchants. Guard the not-found/null case as a clean 404.
+> **MUST scope asset downloads.** Authorize the *membership* (it belongs to the
+> user) AND look up the asset **scoped to that membership's program**, enforcing
+> the asset's own `visibility` / `group_ids` / `affiliate_ids` — never resolve an
+> asset by id alone, so an affiliate can only reach assets in their own program.
+> Guard the not-found/null case as a clean 404.
 
 ---
 
@@ -565,7 +588,7 @@ notifications.
   **Add `commission_earned` / `payout_paid` yourself** if your customers want them.
 - **Outbound webhook signing** (copy verbatim for integrator compatibility):
   ```
-  secret  = webhook.signSecret || webhook.client.secret
+  secret  = webhook.signSecret || webhook.accessToken.client.secret
   X-Mantle-Hmac-SHA256 = hex( HMAC-SHA256(secret, `${unixSeconds}.${JSON.stringify(payload)}`) )
   headers: X-Timestamp (unix seconds), X-Mantle-Webhook-Topic, X-Mantle-Hmac-SHA256, X-Mantle-Org-Id
   POST, 5s timeout; non-2xx throws → retried (attempts: 10, exponential backoff, 1s base)
@@ -577,32 +600,34 @@ notifications.
 
 ## 11. MUST / MUST NOT rules (the gotchas)
 
-Each encodes a real bug or hard lesson. Treat as acceptance criteria.
+Each encodes a deliberate design decision or a sharp edge worth getting right.
+Treat as acceptance criteria.
 
 - **MUST scope handle resolution to the app/program.** Same handle can exist in
   another program.
 - **MUST pick and consistently apply ONE de-dup policy** for "one active
-  attribution per install," guarded by a per-install lock. Mantle is non-uniform
-  across entry paths — that inconsistency is itself the bug.
-- **MUST treat rule resolution as a non-merge** — overriding drops the parent's
-  commission fields (`percentCommission`, `durationMonths`, `revenueComponents`,
-  `minPlanValue`), even with an empty override. **Port the rule-resolution unit
-  tests verbatim.**
+  attribution per install," across every entry path, guarded by a per-install lock.
+- **MUST treat rule resolution as a non-merge** — a `custom` or attribution
+  override drops ALL of the parent's commission fields (`percentCommission`,
+  `durationMonths`, `revenueComponents`, `minPlanValue`), even with an empty
+  override; a `group` override drops only the commission fields the group itself
+  defines (per-field merge). **Port the rule-resolution unit tests verbatim.**
 - **MUST decide your refund policy on purpose.** A non-positive transaction
-  (`grossAmount <= 0`) is *silently skipped, not clawed back*. Cancellation is
-  manual-only. If you promise "claw back on refund," build it.
+  (`grossAmount <= 0`) earns nothing and is not auto-reversed; voiding a commission
+  is an explicit admin action. If you promise "claw back on refund," build it.
 - **MUST start the percent window at the first commission's date,** not the
   attribution date.
 - **MUST attach the signup bonus to the first *eligible* transaction** (it fires
   only when no earlier commission exists).
-- **MUST dedup per `(affiliate, transaction)`** — one transaction yields at most
-  one program's commissions; the dedup `break`s the program loop.
+- **MUST dedup per `(affiliate, transaction)`** — a transaction already commissioned
+  is skipped on re-run (the sweep is idempotent). With one active attribution per
+  install, a transaction yields at most one program's commission set.
 - **MUST gate only NEW payout creation on the minimum** — commissions still append
   to an existing pending payout below it.
 - **MUST run aggregation and payment under per-affiliate locks**, and key every
   external charge/transfer with an idempotency key.
 - **MUST gate Stripe transfers on the connected account's LIVE `transfers`
-  capability** before charging — fail closed (real money-leak fix).
+  capability** before charging — fail closed.
 - **MUST handle Stripe partial-batch failure** — you charged the full batch but
   only some transfers landed; reconcile the shortfall (only all-fail auto-refunds).
 - **MUST use `paypal_email || email`** as the PayPal recipient.
@@ -622,13 +647,13 @@ Each encodes a real bug or hard lesson. Treat as acceptance criteria.
 
 ## 12. Caveats (read before going to production)
 
-- **Currency.** Mantle does **no FX anywhere**; amounts are in the transaction's
-  native units and the importers hardcode `USD`; PayPal items post `currency:
-  "USD"`. If you serve non-USD merchants, normalize currency explicitly across
-  transaction amount, commission amount, and payout — don't assume single-currency.
-- **Float precision.** Amounts are stored via `parseFloat` with no rounding at
-  creation (rounding happens only in the Stripe fee math and reconcile). If you
-  need exact money, store integer minor units.
+- **Currency is single-rail by default.** The model carries **no FX**: amounts are
+  in the transaction's native units, imports assume `USD`, and PayPal items post
+  `currency: "USD"`. If you serve non-USD merchants, normalize currency explicitly
+  across transaction amount, commission amount, and payout rather than assuming one.
+- **Money precision.** If you compute amounts with floating point and only round at
+  the payment boundary, stored values can carry float artifacts. For exact money,
+  store integer minor units.
 - **Skip the Shopify-only scaffolding.** The Google-Analytics→BigQuery attribution
   reconstruction exists solely because the App Store strips query params; drop it
   if you own your funnel. The competitor-importer pipeline is Mantle-specific —
